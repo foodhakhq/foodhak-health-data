@@ -44,8 +44,20 @@ class TimestreamClient:
             config=boto_config
         )
 
+        # S3 client for storing bulky payload parts and full payloads
+        self.s3_client = boto3.client(
+            's3',
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+            region_name=settings.AWS_REGION,
+            config=boto_config
+        )
+
         self.database_name = settings.TIMESTREAM_DATABASE
         self.table_name = settings.TIMESTREAM_TABLE
+        # S3 settings
+        self.s3_bucket = getattr(settings, 'S3_BUCKET', None)
+        self.s3_prefix = getattr(settings, 'S3_PREFIX', 'health-data')
 
     def write_health_data(
         self,
@@ -100,12 +112,50 @@ class TimestreamClient:
             # Validate data before writing
             if not isinstance(data, dict):
                 raise ValueError("data must be a dictionary")
-            
-            # Ensure data can be serialized to JSON
+
+            # Prepare payload and enforce size constraints (Timestream VARCHAR <= 2048)
+            payload: Dict[str, Any] = dict(data)
+
+            # No separate step_samples offload; include them in the full payload S3 object
+
+            # Also store the full payload in S3 and keep a reference
             try:
-                json.dumps(data)
+                if self.s3_bucket:
+                    date_str = actual_start_time.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                    provider_type_s = provider_type_str
+                    full_key = f"{self.s3_prefix}/{user_id}/{provider_type_s}/{schema_type}/{date_str}/payload_{int(time.time()*1000)}.json"
+                    payload_s3_key = self._upload_json_to_s3(full_key, payload)
+                    payload = dict(payload)
+                    payload['payload_s3_key'] = payload_s3_key
+            except Exception as s3e:
+                logger.error(f"Failed to offload full payload to S3: {str(s3e)}")
+
+            # Serialize and check size
+            try:
+                payload_str = json.dumps(payload)
             except (TypeError, ValueError) as e:
                 raise ValueError(f"Data cannot be serialized to JSON: {str(e)}")
+
+            if len(payload_str) > 2048:
+                # Fallback to minimal representation (preserve S3 reference)
+                minimal: Dict[str, Any] = {
+                    'metadata': payload.get('metadata', {}),
+                }
+                if 'distance_data' in payload and isinstance(payload['distance_data'], dict):
+                    minimal['distance_data'] = {
+                        'steps': payload['distance_data'].get('steps', 0)
+                    }
+                # Include compact heart rate summary if it fits
+                if 'heart_rate_data' in payload and isinstance(payload['heart_rate_data'], dict):
+                    summary = payload['heart_rate_data'].get('summary', {})
+                    test_str = json.dumps({**minimal, 'heart_rate_data': {'summary': summary}})
+                    if len(test_str) <= 2048:
+                        minimal['heart_rate_data'] = {'summary': summary}
+                # Preserve pointer to full payload stored in S3
+                if 'payload_s3_key' in payload:
+                    minimal['payload_s3_key'] = payload['payload_s3_key']
+                payload = minimal
+                payload_str = json.dumps(payload)
 
             # Prepare the record with both actual and record timestamps in dimensions
             record = {
@@ -118,7 +168,7 @@ class TimestreamClient:
                     {'Name': 'local_timezone', 'Value': local_timezone},
                 ],
                 'MeasureName': 'health_data',
-                'MeasureValue': json.dumps(data),
+                'MeasureValue': payload_str,
                 'MeasureValueType': 'VARCHAR',
                 'Time': str(record_time),
                 'Version': record_version
@@ -185,6 +235,16 @@ class TimestreamClient:
             if hasattr(e, 'response'):
                 logger.error(f"Error response: {json.dumps(e.response, indent=2)}")
             return False
+
+    def _upload_json_to_s3(self, key: str, obj: Dict[str, Any]) -> str:
+        body = json.dumps(obj).encode("utf-8")
+        self.s3_client.put_object(
+            Bucket=self.s3_bucket,
+            Key=key,
+            Body=body,
+            ContentType="application/json"
+        )
+        return key
 
     # def query_health_data(
     #         self,
@@ -305,9 +365,10 @@ class TimestreamClient:
             response = self.query_client.query(QueryString=query)
 
             results = []
+            print("response------>", response)
             for row in response.get('Rows', []):
                 try:
-                    data = {
+                    record = {
                         'provider_type': row['Data'][0]['ScalarValue'],
                         'user_id': row['Data'][1]['ScalarValue'],
                         'schema_type': row['Data'][2]['ScalarValue'],
@@ -315,7 +376,14 @@ class TimestreamClient:
                         'timestamp': datetime.fromisoformat(row['Data'][4]['ScalarValue'].replace('Z', '+00:00')),
                         'data': json.loads(row['Data'][5]['ScalarValue'])
                     }
-                    results.append(data)
+                    # Expand S3 reference if present
+                    if isinstance(record['data'], dict) and 'payload_s3_key' in record['data'] and self.s3_bucket:
+                        try:
+                            s3_key = record['data']['payload_s3_key']
+                            record['data'] = self._fetch_json_from_s3(s3_key)
+                        except Exception as e:
+                            logger.error(f"Failed to fetch payload from S3 for key %s: %s", s3_key, str(e))
+                    results.append(record)
                 except (KeyError, json.JSONDecodeError, ValueError) as e:
                     logger.error(f"Error parsing row data: {str(e)}")
                     continue
@@ -325,6 +393,11 @@ class TimestreamClient:
         except Exception as e:
             logger.error(f"Error querying Timestream: {str(e)}")
             raise
+
+    def _fetch_json_from_s3(self, key: str) -> Dict[str, Any]:
+        response = self.s3_client.get_object(Bucket=self.s3_bucket, Key=key)
+        body = response['Body'].read()
+        return json.loads(body)
 
 
 

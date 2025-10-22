@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     AWS_ACCOUNT_ID: str = "469379297648"
     ENVIRONMENT: str = "dev"
 
+    # S3 Settings for storing raw payloads
+    S3_BUCKET: Optional[str] = "health-data-bucket-foodhak"
+    S3_PREFIX: str = "health-data"
+
     # Health Check Settings
     HEALTH_CHECK_SERVICES_STR: str = "database,timestream"  # Store as string
     HEALTH_CHECK_TIMEOUT: int = 5  # seconds
