@@ -1,11 +1,14 @@
-from http.client import HTTPException
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Query
+from typing import Optional, Dict, Any, List
 from models.health_data_validation import HealthData
 from services.health_data_service import HealthDataService
-import json
-import logging
+from utils.timestream import TimestreamClient
+from models.schemas import DeviceType, HealthDataListResponse, HealthDataRecord
+
 
 router = APIRouter()
+
+timestream_client = TimestreamClient()
 
 
 @router.post('/health_data', response_model=HealthData)
@@ -17,55 +20,43 @@ def health_data(health_data_req: HealthData):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post('/webhook')
-async def webhook(request: Request):
-    """
-    Webhook endpoint to receive payload data from external services
-    """
+@router.get('/health_data/latest', response_model=HealthDataListResponse)
+def get_latest_health_data(
+    user_id: str = Query(..., alias="foodhak_user_id"),
+    provider_type: DeviceType = Query(...),
+    schema_type: Optional[str] = Query(None)
+):
     try:
-        # Get the raw body as bytes
-        body = await request.body()
-        
-        # Try to parse as JSON
-        try:
-            payload = json.loads(body.decode('utf-8'))
-            print("=== WEBHOOK PAYLOAD RECEIVED ===")
-            print(f"Content-Type: {request.headers.get('content-type', 'Not specified')}")
-            print(f"Payload: {json.dumps(payload, indent=2)}")
-            print("=== END WEBHOOK PAYLOAD ===")
-            
-            # Log the payload
-            logger = logging.getLogger("log")
-            logger.info(f"Webhook payload received: {json.dumps(payload, indent=2)}")
-            
-            return {
-                "status": "success",
-                "message": "Webhook payload received and processed",
-                "payload_size": len(body),
-                "timestamp": "2025-01-27T10:00:00Z"
-            }
-            
-        except json.JSONDecodeError:
-            # If not JSON, print as text
-            text_payload = body.decode('utf-8')
-            print("=== WEBHOOK TEXT PAYLOAD RECEIVED ===")
-            print(f"Content-Type: {request.headers.get('content-type', 'Not specified')}")
-            print(f"Payload: {text_payload}")
-            print("=== END WEBHOOK TEXT PAYLOAD ===")
-            
-            # Log the payload
-            logger = logging.getLogger("log")
-            logger.info(f"Webhook text payload received: {text_payload}")
-            
-            return {
-                "status": "success",
-                "message": "Webhook text payload received and processed",
-                "payload_size": len(body),
-                "timestamp": "2025-01-27T10:00:00Z"
-            }
-            
-    except Exception as e:
-        logger = logging.getLogger("log")
-        logger.error(f"Error processing webhook: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing webhook: {str(e)}")
+        # Fetch records (ordered by date desc in query)
+        results = timestream_client.query_health_data(
+            user_id=user_id,
+            provider_type=provider_type,
+            schema_type=schema_type
+        )
 
+        # Keep only the latest record per schema_type
+        latest_by_schema: Dict[str, Dict[str, Any]] = {}
+        for r in results:
+            st = r.get('schema_type')
+            if st and st not in latest_by_schema:
+                latest_by_schema[st] = r
+
+        records: List[HealthDataRecord] = []
+        for st, r in latest_by_schema.items():
+            records.append(
+                HealthDataRecord(
+                    provider_type=r['provider_type'],
+                    user_id=r['user_id'],
+                    schema_type=r['schema_type'],
+                    measure_name=r['measure_name'],
+                    timestamp=r['timestamp'],
+                    data=r['data']
+                )
+            )
+
+        return HealthDataListResponse(
+            message="Latest health data per schema",
+            data=records
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
