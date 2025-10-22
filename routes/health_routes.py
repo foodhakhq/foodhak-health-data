@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 import json
+import boto3
 import asyncio
 from sqlalchemy import text
 from contextlib import asynccontextmanager
@@ -27,7 +28,7 @@ router = APIRouter()
 auth_router = APIRouter()
 
 timestream_client = TimestreamClient()
-
+s3_client = boto3.client("s3")
 # Configure logging
 logger = logging.getLogger(__name__)
 
@@ -308,14 +309,14 @@ async def get_health_data(
 ):
     """
     Retrieve health data from Timestream
-    
+
     Parameters:
     - user_id: The ID of the user to retrieve health data for
     - provider_type: Filter by device type (e.g., APPLE_HEALTH, GOOGLE_FIT)
     - schema_type: Filter by schema type (e.g., daily, body, sleep)
     - start_date: Start date in ISO 8601 format (e.g., 2025-05-09T00:00:00Z)
     - end_date: End date in ISO 8601 format (e.g., 2025-05-09T23:59:59Z)
-    
+
     Example:
     /api/v1/health/health-data/{user_id}?provider_type=APPLE_HEALTH&start_date=2025-05-09T00:00:00Z&end_date=2025-05-09T23:59:59Z
     """
@@ -333,7 +334,7 @@ async def get_health_data(
             provider_type=provider_type,
             schema_type=schema_type
         )
-        
+
         # The results are now a list of records
         return HealthDataListResponse(
             status="success",
@@ -449,6 +450,79 @@ async def check_connection_status(
             )
             for conn in connections
         ]
+    )
+
+@auth_router.post("/health-data/batch", response_model=HealthDataResponse, dependencies=[Depends(get_current_user)])
+async def process_health_data_batch(
+    requests: List[HealthDataRequest],
+    db: Session = Depends(get_db)
+):
+    """
+    Process and store a batch of health data records from devices
+    """
+    logger.info(f"Processing batch health data for {len(requests)} records")
+    processed = 0
+    errors = []
+    stored_records = StoredRecords()
+    batch_response = []
+    for idx, request in enumerate(requests):
+        try:
+            # Verify device connection
+            connection = db.query(DeviceConnection).filter(
+                DeviceConnection.foodhak_user_id == request.foodhak_user_id,
+                DeviceConnection.device_type == request.provider_type,
+                DeviceConnection.is_connected == True
+            ).first()
+            if not connection:
+                logger.warning(f"No active connection found for user {request.foodhak_user_id} and device type {request.provider_type}")
+                errors.append({"index": idx, "error": f"No active connection for device type {request.provider_type}"})
+                continue
+            # Transform the data
+            transformed_data = DataTransformer.transform_health_data(
+                request.provider_type,
+                request.dict()
+            )
+            # Store each type of data in Timestream
+            for schema_type, data in [
+                ("daily", transformed_data["daily_data"]),
+                ("body", transformed_data["body_data"]),
+                ("sleep", transformed_data["sleep_data"])
+            ]:
+                if data:
+                    success = timestream_client.write_health_data(
+                        user_id=str(request.foodhak_user_id),
+                        provider_type=request.provider_type,
+                        schema_type=schema_type,
+                        data=data,
+                        start_time=request.start_time,
+                        end_time=request.end_time,
+                        local_timezone=request.local_timezone
+                    )
+                    if not success:
+                        errors.append({"index": idx, "error": f"Failed to write {schema_type} data to Timestream"})
+                        continue
+                    setattr(stored_records, schema_type, getattr(stored_records, schema_type) + 1)
+            # Update last sync time
+            connection.last_sync_at = datetime.utcnow()
+            db.commit()
+            batch_response.append({
+                "user_id": request.foodhak_user_id,
+                "daily_data": transformed_data["daily_data"],
+                "body_data": transformed_data["body_data"],
+                "sleep_data": transformed_data["sleep_data"]
+            })
+            processed += 1
+        except Exception as e:
+            logger.error(f"Error in batch item {idx}: {str(e)}")
+            errors.append({"index": idx, "error": str(e)})
+    return HealthDataResponse(
+        status="success" if processed == len(requests) and not errors else "partial_success",
+        message=f"Processed {processed} out of {len(requests)} records.",
+        data={
+            "batch_response": batch_response,
+            "stored_records": stored_records.dict(),
+            "errors": errors
+        }
     )
 
 # Include both routers in the main router
