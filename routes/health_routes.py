@@ -525,5 +525,43 @@ async def process_health_data_batch(
         }
     )
 
+@auth_router.delete(
+    "/connect/{user_id}",
+    response_model=DisconnectResponse,
+    dependencies=[Depends(get_current_user)]
+)
+async def clear_all_device_connections(
+    user_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    HARD DELETE all health device connections for a user
+    """
+    try:
+        deleted_count = (
+            db.query(DeviceConnection)
+            .filter(DeviceConnection.foodhak_user_id == user_id)
+            .delete(synchronize_session=False)
+        )
+
+        db.commit()
+
+        return DisconnectResponse(
+            status="success",
+            message="All device connections deleted successfully",
+            data={
+                "deleted_count": deleted_count
+            }
+        )
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error hard deleting device connections for user {user_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error clearing device connections: {str(e)}"
+        )
+
+
 # Include both routers in the main router
-router.include_router(auth_router) 
+router.include_router(auth_router)
